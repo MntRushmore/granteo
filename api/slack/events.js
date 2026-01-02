@@ -2,17 +2,31 @@ const { App, SocketModeReceiver } = require('@slack/bolt');
 const { ConsoleLogger } = require('@slack/logger');
 const customLogger = new ConsoleLogger();
 customLogger.setLevel('error');
-const { WebClient } = require('@slack/web-api');
-const { getOrgs, sendGrant } = require('../hcb.js');
+const { getOrgs, sendGrant, prisma, findOrCreateUser } = require('../hcb.js');
 
 const transactionsCommand = require('../../commands/transactions');
 const orgInfoCommand = require('../../commands/orginfo');
 const bankUrlCommand = require('../../commands/bank_url');
 const grantsForCommand = require('../../commands/grants_for.js');
-const grantCommand = require('../../commands/grant.js');
 const registerLoginCommand = require('../../commands/login');
 
 require('dotenv').config();
+
+// Validate required environment variables
+const requiredEnvVars = [
+  'SLACK_APP_TOKEN',
+  'SLACK_BOT_TOKEN',
+  'SLACK_SIGNING_SECRET',
+  'DATABASE_URL',
+  'LOGS_CHANNEL_ID'
+];
+
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingEnvVars.join(', '));
+  console.error('Please set these variables in your .env file');
+  process.exit(1);
+}
 
 // Configure a Socket Mode receiver with extended ping/pong timeouts
 const receiver = new SocketModeReceiver({
@@ -21,10 +35,8 @@ const receiver = new SocketModeReceiver({
   pongTimeout: 20000
 });
 
-
 if (process.env.NODE_ENV === 'development') {
   console.log('🔁 Hot reload enabled (watching for file changes)');
-  console.log('code edited');
 }
 
 const app = new App({
@@ -43,165 +55,258 @@ if (process.env.NODE_ENV === 'development') {
   app.event('app_mention', logEvent);
 }
 
-const pendingGrants = {};
-const grantCounts = {};
-const grantTemplates = {};
-
-app.event('message', async ({ event, client }) => {
-  if (event.channel === 'rushils-racoons' && event.text && event.text.toLowerCase().includes('shut up') && !event.subtype) {
-    await client.chat.postMessage({
-      channel: event.channel,
-      text: 'no'
-    });
-  }
-});
-
-
+// Grant template commands with database persistence
 app.command('/grant_template', async ({ ack, body, client }) => {
   await ack();
 
-  const { amount, email, organization } = body.text.split(' ');
+  try {
+    const parts = body.text.trim().split(/\s+/);
+    if (parts.length < 3) {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: '❌ Invalid format. Usage: `/grant_template <amount> <email> <organization>`\nExample: `/grant_template 100 recipient@example.com my-org-slug`'
+      });
+      return;
+    }
 
-  grantTemplates[body.user_id] = {
-    amount,
-    email,
-    organization
-  };
+    const [amount, email, organization] = parts;
 
-  await client.chat.postMessage({
-    channel: body.user_id,
-    text: `:white_check_mark: Template created for ${email} with amount $${amount}.`
-  });
+    // Validate inputs
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: '❌ Invalid amount. Please provide a positive number.'
+      });
+      return;
+    }
+
+    if (!email.includes('@')) {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: '❌ Invalid email address.'
+      });
+      return;
+    }
+
+    // Get user info
+    const userInfo = await client.users.info({ user: body.user_id });
+    const userEmail = userInfo.user.profile.email;
+    const user = await findOrCreateUser(userEmail);
+
+    // Create template in database
+    await prisma.grantTemplate.create({
+      data: {
+        userId: user.id,
+        amount: amount,
+        email: email,
+        organization: organization
+      }
+    });
+
+    await client.chat.postMessage({
+      channel: body.user_id,
+      text: `✅ Template created for ${email} with amount $${amount} from ${organization}.`
+    });
+  } catch (error) {
+    console.error('Error creating template:', error);
+    await client.chat.postMessage({
+      channel: body.user_id,
+      text: '❌ Failed to create template. Please try again.'
+    });
+  }
 });
 
 app.command('/grant_template_delete', async ({ ack, body, client }) => {
   await ack();
 
-  delete grantTemplates[body.user_id];
+  try {
+    // Get user info
+    const userInfo = await client.users.info({ user: body.user_id });
+    const userEmail = userInfo.user.profile.email;
+    const user = await findOrCreateUser(userEmail);
 
-  await client.chat.postMessage({
-    channel: body.user_id,
-    text: `:x: Template deleted successfully.`
-  });
+    // Delete all templates for this user
+    const result = await prisma.grantTemplate.deleteMany({
+      where: { userId: user.id }
+    });
+
+    if (result.count === 0) {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: '⚠️ No templates found to delete.'
+      });
+    } else {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: `✅ Deleted ${result.count} template(s) successfully.`
+      });
+    }
+  } catch (error) {
+    console.error('Error deleting templates:', error);
+    await client.chat.postMessage({
+      channel: body.user_id,
+      text: '❌ Failed to delete templates. Please try again.'
+    });
+  }
 });
 
-app.command('/grant list_templates', async ({ ack, body, client }) => {
+app.command('/grant_list_templates', async ({ ack, body, client }) => {
   await ack();
 
-  const template = grantTemplates[body.user_id];
-  const userTemplates = template
-    ? `Template: ${body.user_id} - Amount: ${template.amount}, Email: ${template.email}, Organization: ${template.organization}`
-    : "No templates found.";
+  try {
+    // Get user info
+    const userInfo = await client.users.info({ user: body.user_id });
+    const userEmail = userInfo.user.profile.email;
+    const user = await findOrCreateUser(userEmail);
 
-  await client.chat.postMessage({
-    channel: body.user_id,
-    text: userTemplates
-  });
+    // Fetch templates from database
+    const templates = await prisma.grantTemplate.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    if (templates.length === 0) {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: '📭 No templates found. Create one with `/grant_template <amount> <email> <organization>`'
+      });
+      return;
+    }
+
+    const templateList = templates.map((t, index) =>
+      `${index + 1}. Amount: $${t.amount}, Email: ${t.email}, Org: ${t.organization}`
+    ).join('\n');
+
+    await client.chat.postMessage({
+      channel: body.user_id,
+      text: `📋 *Your Grant Templates:*\n${templateList}`
+    });
+  } catch (error) {
+    console.error('Error listing templates:', error);
+    await client.chat.postMessage({
+      channel: body.user_id,
+      text: '❌ Failed to list templates. Please try again.'
+    });
+  }
 });
 
 app.command('/grant', async ({ ack, body, client }) => {
   await ack();
-  pendingGrants[body.user_id] = Date.now();
 
-  const userInfo = await client.users.info({
-    user: body.user_id
-  });
-  const userEmail = userInfo.user.profile.email;
-  console.log("📧 Slack user email used to fetch DB record:", userEmail);
-  const orgs = await getOrgs(userEmail);
-  
-  if (!orgs || orgs.length === 0) {
+  try {
+    const userInfo = await client.users.info({
+      user: body.user_id
+    });
+    const userEmail = userInfo.user.profile.email;
+    console.log("📧 Slack user email used to fetch DB record:", userEmail);
+
+    const orgs = await getOrgs(userEmail);
+
+    if (!orgs || orgs.length === 0) {
+      await client.chat.postMessage({
+        channel: body.user_id,
+        text: "❌ No organizations found for your email. Please make sure you're associated with an organization in Hack Club Bank."
+      });
+      return;
+    }
+
+    // Get user's templates from database
+    const user = await findOrCreateUser(userEmail);
+    const templates = await prisma.grantTemplate.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: 'desc' },
+      take: 5 // Limit to 5 most recent templates
+    });
+
+    const templateOptions = templates.length > 0
+      ? templates.map(t => ({
+          text: {
+            type: 'plain_text',
+            text: `$${t.amount} to ${t.email} (${t.organization})`
+          },
+          value: JSON.stringify({
+            amount: t.amount,
+            email: t.email,
+            organization: t.organization
+          })
+        }))
+      : [{
+          text: { type: 'plain_text', text: 'No templates available' },
+          value: 'none'
+        }];
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'grant_modal',
+        title: { type: 'plain_text', text: 'Send Grant' },
+        submit: { type: 'plain_text', text: 'Send' },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: [
+          {
+            type: 'section',
+            text: { type: 'mrkdwn', text: '*Choose a template or create a new grant:*' },
+          },
+          {
+            type: 'input',
+            block_id: 'template_block',
+            element: {
+              type: 'static_select',
+              action_id: 'template',
+              placeholder: { type: 'plain_text', text: 'Select template (optional)' },
+              options: templateOptions,
+            },
+            label: { type: 'plain_text', text: 'Template' },
+            optional: true
+          },
+          {
+            type: 'input',
+            block_id: 'amount_block',
+            element: {
+              type: 'plain_text_input',
+              action_id: 'amount',
+              placeholder: {
+                type: 'plain_text',
+                text: 'Enter the grant amount',
+              },
+            },
+            label: { type: 'plain_text', text: 'Grant Amount ($)' },
+          },
+          {
+            type: 'input',
+            block_id: 'email_block',
+            element: {
+              type: 'plain_text_input',
+              action_id: 'email',
+            },
+            label: { type: 'plain_text', text: 'Recipients Email' },
+          },
+          {
+            type: 'input',
+            block_id: 'org_block',
+            element: {
+              type: 'static_select',
+              action_id: 'organization',
+              placeholder: { type: 'plain_text', text: 'Select your organization' },
+              options: orgs,
+            },
+            label: { type: 'plain_text', text: 'Organization' },
+          },
+        ],
+      },
+    });
+  } catch (error) {
+    console.error('❌ Error opening grant modal:', error);
     await client.chat.postMessage({
       channel: body.user_id,
-      text: "❌ No organizations found for your email. Please make sure you're associated with an organization in Hack Club Bank."
+      text: `❌ Failed to open grant form: ${error.message}`
     });
-    return;
   }
-
-  const userTemplate = grantTemplates[body.user_id];
-  const userTemplates = userTemplate
-    ? [
-        `Amount: ${userTemplate.amount}, Email: ${userTemplate.email}, Organization: ${userTemplate.organization}`
-      ]
-    : [];
-  
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: {
-      type: 'modal',
-      callback_id: 'grant_modal',
-      title: { type: 'plain_text', text: 'Send Grant' },
-      submit: { type: 'plain_text', text: 'Send' },
-      close: { type: 'plain_text', text: 'Cancel' },
-      blocks: [
-        {
-          type: 'section',
-          text: { type: 'mrkdwn', text: 'Choose a template or create a new one:' },
-        },
-        {
-          type: 'input',
-          block_id: 'template_block',
-          element: {
-            type: 'static_select',
-            action_id: 'template',
-            placeholder: { type: 'plain_text', text: 'Select template' },
-            options: userTemplates.length > 0
-              ? [
-                  {
-                    text: { type: 'plain_text', text: userTemplates[0] },
-                    value: userTemplates[0],
-                  },
-                ]
-              : [
-                  {
-                    text: { type: 'plain_text', text: 'No templates available' },
-                    value: 'none',
-                  },
-                ],
-          },
-          label: { type: 'plain_text', text: 'Template' },
-        },
-        {
-          type: 'input',
-          block_id: 'amount_block',
-          element: {
-            type: 'plain_text_input',
-            action_id: 'amount',
-            placeholder: {
-              type: 'plain_text',
-              text: 'Enter the grant amount',
-            },
-          },
-          label: { type: 'plain_text', text: 'Grant Amount ($)' },
-        },
-        {
-          type: 'input',
-          block_id: 'email_block',
-          element: {
-            type: 'plain_text_input',
-            action_id: 'email',
-          },
-          label: { type: 'plain_text', text: 'Recipients Email' },
-        },
-        {
-          type: 'input',
-          block_id: 'org_block',
-          element: {
-            type: 'static_select',
-            action_id: 'organization',
-            placeholder: { type: 'plain_text', text: 'Select your organization' },
-            options: 
-              orgs
-            ,
-          },
-          label: { type: 'plain_text', text: 'Organization' },
-        },
-      ],
-    },
-  });
 });
 
-app.view('grant_modal', async ({ ack, body, view, client }) => {
+app.view('grant_modal', async ({ ack, view }) => {
   await ack({
     response_action: 'update',
     view: {
@@ -230,7 +335,6 @@ app.view('grant_modal', async ({ ack, body, view, client }) => {
 
 app.view('confirm_grant_modal', async ({ ack, body, view, client }) => {
   await ack();
-  delete pendingGrants[body.user.id];
 
   const values = JSON.parse(view.private_metadata);
   const amount = values.amount_block.amount.value;
@@ -255,13 +359,13 @@ app.view('confirm_grant_modal', async ({ ack, body, view, client }) => {
 
     await client.chat.postMessage({
       channel: body.user.id,
-      text: `:white_check_mark: Grant successfully sent to ${email} for $${amount}`
+      text: `✅ Grant successfully sent to ${email} for $${amount}`
     });
 
-    // Log grant info to #granteo-logs before celebration gif
+    // Log grant info to logs channel
     try {
       await client.chat.postMessage({
-        channel: 'C0848BEH5A4',
+        channel: process.env.LOGS_CHANNEL_ID,
         text: `:money_with_wings: *Grant Sent*\n• To: ${email}\n• Amount: $${amount}\n• Org: ${organization}\n• Sent by: <@${body.user.id}>`
       });
     } catch (err) {
@@ -283,39 +387,24 @@ app.view('confirm_grant_modal', async ({ ack, body, view, client }) => {
 
     await client.chat.postMessage({
       channel: body.user.id,
-      text: `:x: Something went wrong when trying to send the grant. Please try again or ask for help.`
+      text: `❌ Something went wrong when trying to send the grant: ${error.message}`
     });
 
     await client.chat.postMessage({
-      channel: 'C0848BEH5A4',
+      channel: process.env.LOGS_CHANNEL_ID,
       text: `:rotating_light: *Grant failed*\n• User: <@${body.user.id}>\n• Email: ${email}\n• Amount: $${amount}\n• Org: ${organization}\n• Error: \`${error.message || error}\``
     });
   }
 });
 
-const dailyLogClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-function scheduleDailyCheckIn() {
-  const now = new Date();
-  const next9am = new Date(now);
-  next9am.setHours(9, 0, 0, 0);
-  if (now >= next9am) {
-    next9am.setDate(next9am.getDate() + 1);
-  }
-  const timeUntilNext9am = next9am - now;
-  setTimeout(() => {
-    dailyLogClient.chat.postMessage({
-      channel: 'C0848BEH5A4',
-      text: `🕘 Daily check-in: Granteo is still online and functioning at ${new Date().toLocaleString()}`
-    });
-    setInterval(() => {
-      dailyLogClient.chat.postMessage({
-        channel: 'C0848BEH5A4',
-        text: `🕘 Daily check-in: Granteo is still online and functioning at ${new Date().toLocaleString()}`
-      });
-    }, 24 * 60 * 60 * 1000);
-  }, timeUntilNext9am);
-}
-scheduleDailyCheckIn();
+// Register other commands
+app.command('/transactions', transactionsCommand);
+app.command('/orginfo', orgInfoCommand);
+app.command('/bank_url', bankUrlCommand);
+app.command('/grants_for', grantsForCommand);
+
+// Register the /login command
+registerLoginCommand(app);
 
 module.exports = app;
 
@@ -324,14 +413,9 @@ module.exports = app;
     await app.start(process.env.PORT || 3030);
     console.log('⚡️ Slack HCB Bot is running on port', process.env.PORT || 3030);
     if (process.env.NODE_ENV === 'development') {
-      const startupClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-      await startupClient.chat.postMessage({
-        channel: 'C0848BEH5A4',
-        text: 'I am now online and or restarted! :tada:',
-      });
-      await startupClient.chat.postMessage({
-        channel: 'C0848BEH5A4',
-        text: ':white_check_mark: Granteo bot has started and is online.',
+      await app.client.chat.postMessage({
+        channel: process.env.LOGS_CHANNEL_ID,
+        text: '✅ Granteo bot has started and is online.',
       });
     }
   } catch (error) {
@@ -351,16 +435,9 @@ process.on('SIGTERM', async () => {
   await app.stop();
   process.exit(0);
 });
+
 process.on('uncaughtException', async (error) => {
   console.error('❌ Uncaught Exception:', error);
   await app.stop();
   process.exit(1);
 });
-app.command('/transactions', transactionsCommand);
-app.command('/orginfo', orgInfoCommand);
-app.command('/bank_url', bankUrlCommand);
-app.command('/grants_for', grantsForCommand);
-app.command('/grant', grantCommand);
-
-// Register the /login command
-registerLoginCommand(app);
